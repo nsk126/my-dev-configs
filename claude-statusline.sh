@@ -1,61 +1,96 @@
-#!/bin/bash
-# Status line: (1) cwd (~ for $HOME), (2) git branch (omitted outside a
-# repo), (3) context window remaining, (4) usage segments mirroring the
-# /usage screen: session (5h), per-model weekly (e.g. Fable), all-models
-# weekly (7d).
-#
-# Note on (4): verified against a live payload captured from this harness
-# (not just the documented schema) -- rate_limits only ever contains
-# five_hour / seven_day / spend_limit (all account-level). There is NO
-# per-model (Fable/Opus/etc.) weekly-limit field in the payload today, so
-# the "Fable:" segment below is a stub, gracefully skipped, kept in case a
-# future harness version adds one under a guessed key (update FABLE_KEYS
-# if/when Anthropic documents the real key name).
+#!/usr/bin/env bash
+# Claude Code status line: RGB gradient, dynamic emoji, cost, code velocity
 
 input=$(cat)
 
-cwd=$(echo "$input" | jq -r '.workspace.current_dir // .cwd')
+# ── Colors ──
+CYAN='\033[36m'
+GREEN='\033[32m'
+YELLOW='\033[33m'
+RED='\033[31m'
+MAGENTA='\033[35m'
+DIM='\033[2m'
+BOLD='\033[1m'
+RESET='\033[0m'
 
-# git branch, gracefully omitted when cwd isn't inside a git repo
-# (must run on the raw path before the ~ substitution below)
-branch=$(git -C "$cwd" --no-optional-locks rev-parse --abbrev-ref HEAD 2>/dev/null)
+# ── Truecolor helper ──
+rgb() { printf '\033[38;2;%d;%d;%dm' "$1" "$2" "$3"; }
 
-# show $HOME as ~, like bash's \w
-case "$cwd" in
-    "$HOME") cwd="~" ;;
-    "$HOME"/*) cwd="~${cwd#$HOME}" ;;
-esac
+# ── Parse JSON fields ──
+model=$(echo "$input" | jq -r '.model.display_name // "Unknown"')
+used=$(echo "$input" | jq -r '.context_window.used_percentage // empty')
+cost=$(echo "$input" | jq -r '.cost.total_cost_usd // 0')
+lines_add=$(echo "$input" | jq -r '.cost.total_lines_added // 0')
+lines_del=$(echo "$input" | jq -r '.cost.total_lines_removed // 0')
+cwd=$(echo "$input" | jq -r '.workspace.current_dir // .cwd // ""')
 
-# context window remaining (percentage)
-ctx_remaining=$(echo "$input" | jq -r '.context_window.remaining_percentage // empty')
-
-# three usage segments, side by side like /usage: session (5h), per-model
-# weekly (not present in the current payload -- see note above), and the
-# all-models weekly window (7d). Values shown are %used, matching /usage.
-five=$(echo "$input" | jq -r '.rate_limits.five_hour.used_percentage // empty')
-fable=$(echo "$input" | jq -r '.rate_limits.seven_day_opus.used_percentage // .rate_limits.seven_day_model.used_percentage // empty')
-week=$(echo "$input" | jq -r '.rate_limits.seven_day.used_percentage // empty')
-spend=$(echo "$input" | jq -r '.rate_limits.spend_limit.used_percentage // empty')
-
-out=$(printf '\033[01;34m%s\033[00m' "$cwd")
-[ -n "$branch" ] && out="$out $(printf '\033[01;32m(%s)\033[00m' "$branch")"
-
-if [ -n "$ctx_remaining" ]; then
-    out="$out | Ctx: $(printf '%.0f' "$ctx_remaining")% left"
+# ── Git info ──
+branch=""
+repo=""
+if [ -n "$cwd" ]; then
+  branch=$(git -C "$cwd" --no-optional-locks symbolic-ref --short HEAD 2>/dev/null)
+  repo=$(basename "$(git -C "$cwd" --no-optional-locks rev-parse --show-toplevel 2>/dev/null)" 2>/dev/null)
 fi
 
-if [ -n "$five" ]; then
-    out="$out | 5h: $(printf '%.0f' "$five")%"
+# ── Context bar: RGB gradient, full blocks only ──
+BAR_WIDTH=20
+
+if [ -n "$used" ]; then
+  used_int=$(printf '%.0f' "$used")
+
+  # Round to nearest block
+  filled=$(( (used_int * BAR_WIDTH + 50) / 100 ))
+
+  bar=""
+  for (( i=0; i<BAR_WIDTH; i++ )); do
+    pos=$(( i * 100 / (BAR_WIDTH - 1) ))
+
+    if [ "$pos" -le 50 ]; then
+      r=$(( 0 + 220 * pos / 50 ))
+      g=200
+      b=$(( 80 - 80 * pos / 50 ))
+    else
+      adj=$(( pos - 50 ))
+      r=220
+      g=$(( 200 - 160 * adj / 50 ))
+      b=$(( 0 + 20 * adj / 50 ))
+    fi
+
+    if [ "$i" -lt "$filled" ]; then
+      bar="${bar}$(rgb $r $g $b)█"
+    else
+      bar="${bar}\033[38;2;60;60;60m░"
+    fi
+  done
+  bar="${bar}${RESET}"
+
+  if [ "$used_int" -ge 90 ]; then status_emoji="🚨"
+  elif [ "$used_int" -ge 70 ]; then status_emoji="🔥"
+  elif [ "$used_int" -ge 20 ]; then status_emoji="⚡"
+  else status_emoji="🟢"; fi
+
+  if [ "$used_int" -ge 90 ]; then pct_color="$RED"
+  elif [ "$used_int" -ge 70 ]; then pct_color="$YELLOW"
+  else pct_color="$GREEN"; fi
+
+  ctx_part="${status_emoji} ${bar} ${pct_color}${used_int}%${RESET}"
+else
+  ctx_part="🟢 \033[38;2;60;60;60m░░░░░░░░░░░░░░░░░░░░${RESET} --%"
 fi
 
-if [ -n "$fable" ]; then
-    out="$out | Fable: $(printf '%.0f' "$fable")%"
-fi
+# ── Cost ──
+cost_part="${YELLOW}$(printf '$%.2f' "$cost")${RESET}"
 
-if [ -n "$week" ]; then
-    out="$out | Wk: $(printf '%.0f' "$week")%"
-elif [ -n "$spend" ]; then
-    out="$out | Spend: $(printf '%.0f' "$spend")%"
-fi
+# ── Code velocity ──
+velocity="${GREEN}+${lines_add}${RESET} ${RED}-${lines_del}${RESET}"
 
-printf '%s' "$out"
+# ── Single line ──
+out=""
+[ -n "$repo" ] && out="${BOLD}${YELLOW}${repo}${RESET}"
+[ -n "$branch" ] && out="${out:+$out }${BOLD}${CYAN}🌿 (${branch})${RESET}"
+out="${out:+$out ${DIM}|${RESET} }${ctx_part}"
+out="${out} ${DIM}|${RESET} ${cost_part}"
+out="${out} ${DIM}|${RESET} ${velocity}"
+out="${out} ${DIM}|${RESET} ${MAGENTA}🤖 ${model}${RESET}"
+
+printf '%b' "$out"
